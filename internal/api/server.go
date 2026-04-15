@@ -595,6 +595,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/routing/strategy", s.mgmt.GetRoutingStrategy)
 		mgmt.PUT("/routing/strategy", s.mgmt.PutRoutingStrategy)
 		mgmt.PATCH("/routing/strategy", s.mgmt.PutRoutingStrategy)
+		mgmt.GET("/routing/max-active-auths", s.mgmt.GetRoutingMaxActiveAuths)
+		mgmt.PUT("/routing/max-active-auths", s.mgmt.PutRoutingMaxActiveAuths)
+		mgmt.PATCH("/routing/max-active-auths", s.mgmt.PutRoutingMaxActiveAuths)
 
 		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
 		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)

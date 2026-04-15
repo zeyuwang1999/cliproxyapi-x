@@ -349,8 +349,10 @@ func (m configTabModel) parseConfig(cfg map[string]any) []configField {
 	// Routing
 	if routing, ok := cfg["routing"].(map[string]any); ok {
 		fields = append(fields, configField{"Routing Strategy", "routing/strategy", "string", getString(routing, "strategy"), nil})
+		fields = append(fields, configField{"Routing Max Active Auths", "routing/max-active-auths", "int", fmt.Sprintf("%.0f", getFloat(routing, "max-active-auths")), nil})
 	} else {
 		fields = append(fields, configField{"Routing Strategy", "routing/strategy", "string", "", nil})
+		fields = append(fields, configField{"Routing Max Active Auths", "routing/max-active-auths", "int", "0", nil})
 	}
 
 	// WebSocket auth

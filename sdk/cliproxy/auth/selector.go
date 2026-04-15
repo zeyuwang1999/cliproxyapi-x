@@ -13,21 +13,45 @@ import (
 	"sync"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 // RoundRobinSelector provides a simple provider scoped round-robin selection strategy.
 type RoundRobinSelector struct {
-	mu      sync.Mutex
-	cursors map[string]int
-	maxKeys int
+	mu             sync.Mutex
+	cursors        map[string]int
+	windows        map[string]*activeWindow
+	maxKeys        int
+	maxActiveAuths int
 }
 
 // FillFirstSelector selects the first available credential (deterministic ordering).
 // This "burns" one account before moving to the next, which can help stagger
 // rolling-window subscription caps (e.g. chat message limits).
 type FillFirstSelector struct{}
+
+func normalizedMaxActiveAuths(cfg *internalconfig.Config) int {
+	if cfg == nil || cfg.Routing.MaxActiveAuths <= 0 {
+		return 0
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy)) {
+	case "", "round-robin", "roundrobin", "rr":
+	default:
+		return 0
+	}
+	return cfg.Routing.MaxActiveAuths
+}
+
+func (s *RoundRobinSelector) SetConfig(cfg *internalconfig.Config) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.maxActiveAuths = normalizedMaxActiveAuths(cfg)
+	s.mu.Unlock()
+}
 
 type blockReason int
 
@@ -265,15 +289,41 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 	if s.cursors == nil {
 		s.cursors = make(map[string]int)
 	}
+	if s.windows == nil {
+		s.windows = make(map[string]*activeWindow)
+	}
 	limit := s.maxKeys
 	if limit <= 0 {
 		limit = 4096
 	}
+	activeLimit := s.maxActiveAuths
 
 	// Check if any available auth has gemini_virtual_parent attribute,
 	// indicating gemini-cli virtual auths that should use credential-level polling.
 	groups, parentOrder := groupByVirtualParent(available)
 	if len(parentOrder) > 1 {
+		if activeLimit > 0 && len(parentOrder) > activeLimit {
+			groupKey := key + "::group"
+			window := s.ensureWindowKey(groupKey, limit)
+			selectedParent := window.pick(parentOrder, activeLimit, true, func(parent string) bool {
+				return len(groups[parent]) > 0
+			})
+			if selectedParent == "" {
+				s.mu.Unlock()
+				return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+			}
+			group := groups[selectedParent]
+			innerKey := key + "::cred:" + selectedParent
+			s.ensureCursorKey(innerKey, limit)
+			innerIndex := s.cursors[innerKey]
+			if innerIndex >= 2_147_483_640 {
+				innerIndex = 0
+			}
+			s.cursors[innerKey] = innerIndex + 1
+			s.mu.Unlock()
+			return group[innerIndex%len(group)], nil
+		}
+
 		// Two-level round-robin: first select a credential group, then pick within it.
 		groupKey := key + "::group"
 		s.ensureCursorKey(groupKey, limit)
@@ -302,6 +352,27 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		return group[innerIndex%len(group)], nil
 	}
 
+	if activeLimit > 0 && len(available) > activeLimit {
+		window := s.ensureWindowKey(key, limit)
+		orderedIDs := make([]string, 0, len(available))
+		for _, auth := range available {
+			orderedIDs = append(orderedIDs, auth.ID)
+		}
+		selectedID := window.pick(orderedIDs, activeLimit, true, nil)
+		if selectedID == "" {
+			s.mu.Unlock()
+			return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+		}
+		for _, auth := range available {
+			if auth != nil && auth.ID == selectedID {
+				s.mu.Unlock()
+				return auth, nil
+			}
+		}
+		s.mu.Unlock()
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+
 	// Flat round-robin for non-grouped auths (original behavior).
 	s.ensureCursorKey(key, limit)
 	index := s.cursors[key]
@@ -319,6 +390,23 @@ func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
 	if _, ok := s.cursors[key]; !ok && len(s.cursors) >= limit {
 		s.cursors = make(map[string]int)
 	}
+}
+
+// ensureWindowKey ensures the active window map has capacity for the given key.
+// Must be called with s.mu held.
+func (s *RoundRobinSelector) ensureWindowKey(key string, limit int) *activeWindow {
+	if s.windows == nil {
+		s.windows = make(map[string]*activeWindow)
+	}
+	if _, ok := s.windows[key]; !ok && len(s.windows) >= limit {
+		s.windows = make(map[string]*activeWindow)
+	}
+	window := s.windows[key]
+	if window == nil {
+		window = &activeWindow{}
+		s.windows[key] = window
+	}
+	return window
 }
 
 // groupByVirtualParent groups auths by their gemini_virtual_parent attribute.

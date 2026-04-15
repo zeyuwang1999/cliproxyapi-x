@@ -216,6 +216,11 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// MaxActiveAuths limits how many ready auths (or grouped virtual parents) actively
+	// participate in routing per provider/model shard when Strategy is round-robin.
+	// 0 disables the limit.
+	MaxActiveAuths int `yaml:"max-active-auths,omitempty" json:"max-active-auths,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

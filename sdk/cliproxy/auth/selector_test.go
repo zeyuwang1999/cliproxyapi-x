@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
@@ -83,6 +84,70 @@ func TestRoundRobinSelectorPick_PriorityBuckets(t *testing.T) {
 		}
 		if got.ID == "c" {
 			t.Fatalf("Pick() #%d unexpectedly selected lower priority auth", i)
+		}
+	}
+}
+
+func TestRoundRobinSelectorPick_MaxActiveAuthsStickyWindow(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+	selector.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{Strategy: "round-robin", MaxActiveAuths: 2},
+	})
+	auths := []*Auth{
+		{ID: "d"},
+		{ID: "b"},
+		{ID: "a"},
+		{ID: "c"},
+	}
+
+	want := []string{"a", "b", "a", "b"}
+	for index, wantID := range want {
+		got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", index, err)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("Pick() #%d auth = %v, want %q", index, got, wantID)
+		}
+	}
+
+	auths = []*Auth{
+		{ID: "d"},
+		{ID: "b"},
+		{ID: "c"},
+	}
+	want = []string{"b", "c", "b"}
+	for index, wantID := range want {
+		got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() refill #%d error = %v", index, err)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("Pick() refill #%d auth = %v, want %q", index, got, wantID)
+		}
+	}
+}
+
+func TestFillFirstSelectorPick_IgnoresMaxActiveAuths(t *testing.T) {
+	t.Parallel()
+
+	selector := &FillFirstSelector{}
+	auths := []*Auth{
+		{ID: "d"},
+		{ID: "b"},
+		{ID: "a"},
+		{ID: "c"},
+	}
+
+	for index := 0; index < 3; index++ {
+		got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", index, err)
+		}
+		if got == nil || got.ID != "a" {
+			t.Fatalf("Pick() #%d auth = %v, want %q", index, got, "a")
 		}
 	}
 }

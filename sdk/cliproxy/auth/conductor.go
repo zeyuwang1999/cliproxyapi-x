@@ -105,6 +105,10 @@ type Selector interface {
 	Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error)
 }
 
+type configAwareSelector interface {
+	SetConfig(*internalconfig.Config)
+}
+
 // Hook captures lifecycle callbacks for observing auth changes.
 type Hook interface {
 	// OnAuthRegistered fires when a new auth is registered.
@@ -187,6 +191,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
+	applyConfigToSelector(selector, &internalconfig.Config{})
 	return manager
 }
 
@@ -196,6 +201,15 @@ func isBuiltInSelector(selector Selector) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func applyConfigToSelector(selector Selector, cfg *internalconfig.Config) {
+	if selector == nil {
+		return
+	}
+	if aware, ok := selector.(configAwareSelector); ok {
+		aware.SetConfig(cfg)
 	}
 }
 
@@ -331,6 +345,9 @@ func (m *Manager) SetSelector(selector Selector) {
 	m.mu.Lock()
 	m.selector = selector
 	m.mu.Unlock()
+	if cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config); cfg != nil {
+		applyConfigToSelector(selector, cfg)
+	}
 	if m.scheduler != nil {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()
@@ -361,6 +378,13 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		cfg = &internalconfig.Config{}
 	}
 	m.runtimeConfig.Store(cfg)
+	m.mu.RLock()
+	selector := m.selector
+	m.mu.RUnlock()
+	applyConfigToSelector(selector, cfg)
+	if m.scheduler != nil {
+		m.scheduler.setConfig(cfg)
+	}
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 

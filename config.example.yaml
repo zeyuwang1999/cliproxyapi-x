@@ -103,6 +103,7 @@ quota-exceeded:
 # Routing strategy for selecting credentials when multiple match.
 routing:
   strategy: "round-robin" # round-robin (default), fill-first
+  max-active-auths: 0 # Round-robin only. 0 disables the active-pool limit. When > 0, only this many ready auths/groups actively participate per provider/model shard.
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
@@ -32,11 +33,12 @@ const (
 
 // authScheduler keeps the incremental provider/model scheduling state used by Manager.
 type authScheduler struct {
-	mu            sync.Mutex
-	strategy      schedulerStrategy
-	providers     map[string]*providerScheduler
-	authProviders map[string]string
-	mixedCursors  map[string]int
+	mu             sync.Mutex
+	strategy       schedulerStrategy
+	maxActiveAuths int
+	providers      map[string]*providerScheduler
+	authProviders  map[string]string
+	mixedCursors   map[string]int
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -86,6 +88,7 @@ type readyView struct {
 	parentOrder  []string
 	parentCursor int
 	children     map[string]*childBucket
+	window       activeWindow
 }
 
 // childBucket keeps the per-parent rotation state for grouped Gemini virtual auths.
@@ -101,6 +104,7 @@ type readyViewCursorState struct {
 	cursor       int
 	parentCursor int
 	childCursors map[string]int
+	window       activeWindowState
 }
 
 type readyBucketCursorState struct {
@@ -112,6 +116,7 @@ func snapshotReadyViewCursors(view readyView) readyViewCursorState {
 	state := readyViewCursorState{
 		cursor:       view.cursor,
 		parentCursor: view.parentCursor,
+		window:       snapshotActiveWindow(view.window),
 	}
 	if len(view.children) == 0 {
 		return state
@@ -130,6 +135,7 @@ func restoreReadyViewCursors(view *readyView, state readyViewCursorState) {
 	if view == nil {
 		return
 	}
+	restoreActiveWindow(&view.window, state.window)
 	if len(view.flat) > 0 {
 		view.cursor = normalizeCursor(state.cursor, len(view.flat))
 	}
@@ -194,6 +200,15 @@ func (s *authScheduler) setSelector(selector Selector) {
 	defer s.mu.Unlock()
 	s.strategy = selectorStrategy(selector)
 	clear(s.mixedCursors)
+}
+
+func (s *authScheduler) setConfig(cfg *internalconfig.Config) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.maxActiveAuths = normalizedMaxActiveAuths(cfg)
 }
 
 // rebuild recreates the complete scheduler state from an auth snapshot.
@@ -270,7 +285,7 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		}
 		return true
 	}
-	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate); picked != nil {
+	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, s.maxActiveAuths, predicate); picked != nil {
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
@@ -323,7 +338,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			_, ok := tried[pinnedAuthID]
 			return !ok
 		}
-		if picked := shard.pickReadyLocked(false, s.strategy, predicate); picked != nil {
+		if picked := shard.pickReadyLocked(false, s.strategy, s.maxActiveAuths, predicate); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -363,7 +378,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			if shard == nil {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, s.strategy, predicate)
+			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, s.strategy, s.maxActiveAuths, predicate)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
@@ -379,7 +394,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	for providerIndex, shard := range candidateShards {
 		segmentStarts[providerIndex] = totalWeight
 		if shard != nil {
-			weights[providerIndex] = shard.readyCountAtPriorityLocked(false, bestPriority)
+			weights[providerIndex] = shard.readyCountAtPriorityLocked(false, bestPriority, s.maxActiveAuths)
 		}
 		totalWeight += weights[providerIndex]
 		segmentEnds[providerIndex] = totalWeight
@@ -417,7 +432,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if shard == nil {
 			continue
 		}
-		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate)
+		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, s.maxActiveAuths, predicate)
 		if picked == nil {
 			continue
 		}
@@ -757,7 +772,7 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 }
 
 // pickReadyLocked selects the next ready auth from the highest available priority bucket.
-func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, maxActiveAuths int, predicate func(*scheduledAuth) bool) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -766,7 +781,7 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 	if !okPriority {
 		return nil
 	}
-	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
+	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, maxActiveAuths, predicate)
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.
@@ -802,7 +817,7 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 
 // pickReadyAtPriorityLocked selects the next ready auth from a specific priority bucket.
 // The caller must ensure expired entries are already promoted when needed.
-func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, maxActiveAuths int, predicate func(*scheduledAuth) bool) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -818,7 +833,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	if strategy == schedulerStrategyFillFirst {
 		picked = view.pickFirst(predicate)
 	} else {
-		picked = view.pickRoundRobin(predicate)
+		picked = view.pickRoundRobinWithActivePool(maxActiveAuths, predicate)
 	}
 	if picked == nil || picked.auth == nil {
 		return nil
@@ -826,7 +841,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	return picked.auth
 }
 
-func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int) int {
+func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int, maxActiveAuths int) int {
 	if m == nil {
 		return 0
 	}
@@ -835,9 +850,9 @@ func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priori
 		return 0
 	}
 	if preferWebsocket && len(bucket.ws.flat) > 0 {
-		return len(bucket.ws.flat)
+		return bucket.ws.activeCount(maxActiveAuths)
 	}
-	return len(bucket.all.flat)
+	return bucket.all.activeCount(maxActiveAuths)
 }
 
 // unavailableErrorLocked returns the correct unavailable or cooldown error for the shard.
@@ -993,6 +1008,49 @@ func buildReadyView(entries []*scheduledAuth) readyView {
 	return view
 }
 
+func (v *readyView) orderedAuthIDs() []string {
+	if v == nil || len(v.flat) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(v.flat))
+	for _, entry := range v.flat {
+		if entry == nil || entry.auth == nil {
+			continue
+		}
+		ids = append(ids, entry.auth.ID)
+	}
+	return ids
+}
+
+func (v *readyView) activeCount(maxActiveAuths int) int {
+	if v == nil {
+		return 0
+	}
+	if maxActiveAuths <= 0 {
+		return len(v.flat)
+	}
+	if len(v.parentOrder) > 1 && len(v.children) > 0 {
+		if len(v.parentOrder) <= maxActiveAuths {
+			return len(v.flat)
+		}
+		v.window.sync(v.parentOrder, maxActiveAuths)
+		total := 0
+		for _, parent := range v.window.active {
+			child := v.children[parent]
+			if child == nil {
+				continue
+			}
+			total += len(child.items)
+		}
+		return total
+	}
+	if len(v.flat) <= maxActiveAuths {
+		return len(v.flat)
+	}
+	v.window.sync(v.orderedAuthIDs(), maxActiveAuths)
+	return len(v.window.active)
+}
+
 // pickFirst returns the first ready entry that satisfies predicate without advancing cursors.
 func (v *readyView) pickFirst(predicate func(*scheduledAuth) bool) *scheduledAuth {
 	for _, entry := range v.flat {
@@ -1027,6 +1085,40 @@ func (v *readyView) pickRoundRobin(predicate func(*scheduledAuth) bool) *schedul
 	return nil
 }
 
+func (v *readyView) pickRoundRobinWithActivePool(maxActiveAuths int, predicate func(*scheduledAuth) bool) *scheduledAuth {
+	if v == nil {
+		return nil
+	}
+	if maxActiveAuths <= 0 {
+		return v.pickRoundRobin(predicate)
+	}
+	if len(v.parentOrder) > 1 && len(v.children) > 0 {
+		return v.pickGroupedWithActivePool(maxActiveAuths, true, predicate)
+	}
+	if len(v.flat) <= maxActiveAuths {
+		return v.pickRoundRobin(predicate)
+	}
+	orderedIDs := v.orderedAuthIDs()
+	if len(orderedIDs) == 0 {
+		return nil
+	}
+	entriesByID := make(map[string]*scheduledAuth, len(v.flat))
+	for _, entry := range v.flat {
+		if entry == nil || entry.auth == nil {
+			continue
+		}
+		entriesByID[entry.auth.ID] = entry
+	}
+	selectedID := v.window.pick(orderedIDs, maxActiveAuths, true, func(authID string) bool {
+		entry := entriesByID[authID]
+		return entry != nil && (predicate == nil || predicate(entry))
+	})
+	if selectedID == "" {
+		return nil
+	}
+	return entriesByID[selectedID]
+}
+
 // pickGroupedRoundRobin rotates across parents first and then within the selected parent.
 func (v *readyView) pickGroupedRoundRobin(predicate func(*scheduledAuth) bool) *scheduledAuth {
 	start := 0
@@ -1051,6 +1143,77 @@ func (v *readyView) pickGroupedRoundRobin(predicate func(*scheduledAuth) bool) *
 			v.parentCursor = parentIndex + 1
 			return entry
 		}
+	}
+	return nil
+}
+
+func (v *readyView) pickGroupedWithActivePool(maxActiveAuths int, roundRobin bool, predicate func(*scheduledAuth) bool) *scheduledAuth {
+	if len(v.parentOrder) <= 1 || len(v.children) == 0 || len(v.parentOrder) <= maxActiveAuths {
+		if roundRobin {
+			return v.pickGroupedRoundRobin(predicate)
+		}
+		return v.pickGroupedFirst(predicate)
+	}
+	selectedParent := v.window.pick(v.parentOrder, maxActiveAuths, roundRobin, func(parent string) bool {
+		child := v.children[parent]
+		return child != nil && child.hasMatch(predicate)
+	})
+	if selectedParent == "" {
+		return nil
+	}
+	child := v.children[selectedParent]
+	if child == nil {
+		return nil
+	}
+	return child.pick(roundRobin, predicate)
+}
+
+func (v *readyView) pickGroupedFirst(predicate func(*scheduledAuth) bool) *scheduledAuth {
+	for _, parent := range v.parentOrder {
+		child := v.children[parent]
+		if child == nil {
+			continue
+		}
+		if picked := child.pick(false, predicate); picked != nil {
+			return picked
+		}
+	}
+	return nil
+}
+
+func (b *childBucket) hasMatch(predicate func(*scheduledAuth) bool) bool {
+	if b == nil {
+		return false
+	}
+	for _, entry := range b.items {
+		if predicate == nil || predicate(entry) {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *childBucket) pick(roundRobin bool, predicate func(*scheduledAuth) bool) *scheduledAuth {
+	if b == nil || len(b.items) == 0 {
+		return nil
+	}
+	if !roundRobin {
+		for _, entry := range b.items {
+			if predicate == nil || predicate(entry) {
+				return entry
+			}
+		}
+		return nil
+	}
+	start := b.cursor % len(b.items)
+	for offset := 0; offset < len(b.items); offset++ {
+		index := (start + offset) % len(b.items)
+		entry := b.items[index]
+		if predicate != nil && !predicate(entry) {
+			continue
+		}
+		b.cursor = index + 1
+		return entry
 	}
 	return nil
 }

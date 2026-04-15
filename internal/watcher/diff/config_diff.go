@@ -87,6 +87,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Routing.Strategy != newCfg.Routing.Strategy {
 		changes = append(changes, fmt.Sprintf("routing.strategy: %s -> %s", oldCfg.Routing.Strategy, newCfg.Routing.Strategy))
 	}
+	if oldCfg.Routing.MaxActiveAuths != newCfg.Routing.MaxActiveAuths {
+		changes = append(changes, fmt.Sprintf("routing.max-active-auths: %d -> %d", oldCfg.Routing.MaxActiveAuths, newCfg.Routing.MaxActiveAuths))
+	}
 
 	// API keys (redacted) and counts
 	if len(oldCfg.APIKeys) != len(newCfg.APIKeys) {

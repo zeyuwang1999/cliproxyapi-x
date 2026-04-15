@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
@@ -115,6 +116,101 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 		}
 		if got.ID != "a" {
 			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, "a")
+		}
+	}
+}
+
+func TestSchedulerPick_RoundRobinMaxActiveAuthsStickyWindow(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "d", Provider: "gemini"},
+		&Auth{ID: "b", Provider: "gemini"},
+		&Auth{ID: "a", Provider: "gemini"},
+		&Auth{ID: "c", Provider: "gemini"},
+	)
+	scheduler.setConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{Strategy: "round-robin", MaxActiveAuths: 2},
+	})
+
+	want := []string{"a", "b", "a", "b"}
+	for index, wantID := range want {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("pickSingle() #%d auth = %v, want %q", index, got, wantID)
+		}
+	}
+
+	scheduler.rebuild([]*Auth{
+		{ID: "d", Provider: "gemini"},
+		{ID: "b", Provider: "gemini"},
+		{ID: "c", Provider: "gemini"},
+	})
+
+	want = []string{"b", "c", "b"}
+	for index, wantID := range want {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() refill #%d error = %v", index, errPick)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("pickSingle() refill #%d auth = %v, want %q", index, got, wantID)
+		}
+	}
+}
+
+func TestSchedulerPick_GroupedMaxActiveAuthsUsesParentWindow(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "p1-a", Provider: "gemini", Attributes: map[string]string{"gemini_virtual_parent": "p1"}},
+		&Auth{ID: "p1-b", Provider: "gemini", Attributes: map[string]string{"gemini_virtual_parent": "p1"}},
+		&Auth{ID: "p2-a", Provider: "gemini", Attributes: map[string]string{"gemini_virtual_parent": "p2"}},
+		&Auth{ID: "p2-b", Provider: "gemini", Attributes: map[string]string{"gemini_virtual_parent": "p2"}},
+		&Auth{ID: "p3-a", Provider: "gemini", Attributes: map[string]string{"gemini_virtual_parent": "p3"}},
+	)
+	scheduler.setConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{Strategy: "round-robin", MaxActiveAuths: 2},
+	})
+
+	want := []string{"p1-a", "p2-a", "p1-b", "p2-b"}
+	for index, wantID := range want {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("pickSingle() #%d auth = %v, want %q", index, got, wantID)
+		}
+	}
+}
+
+func TestSchedulerPick_FillFirstIgnoresMaxActiveAuths(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "d", Provider: "gemini"},
+		&Auth{ID: "b", Provider: "gemini"},
+		&Auth{ID: "a", Provider: "gemini"},
+		&Auth{ID: "c", Provider: "gemini"},
+	)
+	scheduler.setConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{Strategy: "fill-first", MaxActiveAuths: 1},
+	})
+
+	for index := 0; index < 3; index++ {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil || got.ID != "a" {
+			t.Fatalf("pickSingle() #%d auth = %v, want %q", index, got, "a")
 		}
 	}
 }
