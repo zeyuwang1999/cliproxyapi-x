@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -48,7 +50,7 @@ func invalidClaudeThinkingPayload() []byte {
 	}`)
 }
 
-func TestAntigravityExecutor_StrictBypassRejectsInvalidSignature(t *testing.T) {
+func TestAntigravityExecutor_StrictBypassStripsInvalidSignatureBeforeForwarding(t *testing.T) {
 	previousCache := cache.SignatureCacheEnabled()
 	previousStrict := cache.SignatureBypassStrictMode()
 	cache.SetSignatureCacheEnabled(false)
@@ -59,8 +61,16 @@ func TestAntigravityExecutor_StrictBypassRejectsInvalidSignature(t *testing.T) {
 	})
 
 	var hits atomic.Int32
+	var bodiesMu sync.Mutex
+	var bodies [][]byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
+		if r.Body != nil {
+			body, _ := io.ReadAll(r.Body)
+			bodiesMu.Lock()
+			bodies = append(bodies, append([]byte(nil), body...))
+			bodiesMu.Unlock()
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}}`))
 	}))
@@ -71,6 +81,17 @@ func TestAntigravityExecutor_StrictBypassRejectsInvalidSignature(t *testing.T) {
 	payload := invalidClaudeThinkingPayload()
 	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude"), OriginalRequest: payload}
 	req := cliproxyexecutor.Request{Model: "claude-sonnet-4-5-thinking", Payload: payload}
+
+	sanitized, err := validateAntigravityRequestSignatures(opts.SourceFormat, payload)
+	if err != nil {
+		t.Fatalf("validateAntigravityRequestSignatures() error = %v", err)
+	}
+	if bytes.Contains(sanitized, []byte(`"type": "thinking"`)) {
+		t.Fatalf("sanitized payload still contains thinking block: %s", sanitized)
+	}
+	if !bytes.Contains(sanitized, []byte(`"text": "hello"`)) {
+		t.Fatalf("sanitized payload dropped non-thinking content: %s", sanitized)
+	}
 
 	tests := []struct {
 		name   string
@@ -103,21 +124,28 @@ func TestAntigravityExecutor_StrictBypassRejectsInvalidSignature(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			err := tt.invoke()
-			if err == nil {
-				t.Fatal("expected invalid signature to return an error")
-			}
-			statusProvider, ok := err.(interface{ StatusCode() int })
-			if !ok {
-				t.Fatalf("expected status error, got %T: %v", err, err)
-			}
-			if statusProvider.StatusCode() != http.StatusBadRequest {
-				t.Fatalf("status = %d, want %d", statusProvider.StatusCode(), http.StatusBadRequest)
+			if err != nil {
+				t.Fatalf("expected invalid signature to be stripped before forwarding, got error: %v", err)
 			}
 		})
 	}
 
-	if got := hits.Load(); got != 0 {
-		t.Fatalf("expected invalid signature to be rejected before upstream request, got %d upstream hits", got)
+	if got := hits.Load(); got != int32(len(tests)) {
+		t.Fatalf("expected %d upstream hits after stripping invalid signatures, got %d", len(tests), got)
+	}
+
+	bodiesMu.Lock()
+	defer bodiesMu.Unlock()
+	if len(bodies) != len(tests) {
+		t.Fatalf("captured %d upstream bodies, want %d", len(bodies), len(tests))
+	}
+	for index, body := range bodies {
+		if bytes.Contains(body, []byte(`"type": "thinking"`)) {
+			t.Fatalf("upstream body #%d still contains thinking block: %s", index, body)
+		}
+		if !bytes.Contains(body, []byte(`hello`)) {
+			t.Fatalf("upstream body #%d dropped text content: %s", index, body)
+		}
 	}
 }
 
