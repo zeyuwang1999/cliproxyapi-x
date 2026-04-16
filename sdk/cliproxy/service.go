@@ -653,7 +653,7 @@ func (s *Service) Run(ctx context.Context) error {
 		if s.coreManager != nil && selectorChanged {
 			var selector coreauth.Selector
 			switch nextStrategy {
-			case "fill-first":
+			case "fill-first", "fillfirst", "ff":
 				selector = &coreauth.FillFirstSelector{}
 			default:
 				selector = &coreauth.RoundRobinSelector{}
