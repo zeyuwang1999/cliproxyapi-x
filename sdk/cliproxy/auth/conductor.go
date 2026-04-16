@@ -350,8 +350,12 @@ func (m *Manager) SetSelector(selector Selector) {
 		selector = &RoundRobinSelector{}
 	}
 	m.mu.Lock()
+	previous := m.selector
 	m.selector = selector
 	m.mu.Unlock()
+	if stoppable, ok := previous.(StoppableSelector); ok && previous != selector {
+		stoppable.Stop()
+	}
 	if cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config); cfg != nil {
 		applyConfigToSelector(selector, cfg)
 	}

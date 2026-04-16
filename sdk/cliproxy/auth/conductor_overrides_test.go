@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -152,6 +153,48 @@ func (e *credentialRetryLimitExecutor) Calls() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.calls
+}
+
+type stoppableTestSelector struct {
+	stopCalls atomic.Int32
+}
+
+func (s *stoppableTestSelector) Pick(context.Context, string, string, cliproxyexecutor.Options, []*Auth) (*Auth, error) {
+	return nil, nil
+}
+
+func (s *stoppableTestSelector) Stop() {
+	s.stopCalls.Add(1)
+}
+
+func (s *stoppableTestSelector) StopCalls() int32 {
+	return s.stopCalls.Load()
+}
+
+func TestManager_SetSelector_StopsPreviousStoppableSelector(t *testing.T) {
+	t.Parallel()
+
+	previous := &stoppableTestSelector{}
+	mgr := NewManager(nil, previous, nil)
+
+	mgr.SetSelector(&RoundRobinSelector{})
+
+	if got := previous.StopCalls(); got != 1 {
+		t.Fatalf("previous selector stop calls = %d, want 1", got)
+	}
+}
+
+func TestManager_SetSelector_DoesNotStopSameSelectorInstance(t *testing.T) {
+	t.Parallel()
+
+	current := &stoppableTestSelector{}
+	mgr := NewManager(nil, current, nil)
+
+	mgr.SetSelector(current)
+
+	if got := current.StopCalls(); got != 0 {
+		t.Fatalf("same selector instance stop calls = %d, want 0", got)
+	}
 }
 
 type authFallbackExecutor struct {
