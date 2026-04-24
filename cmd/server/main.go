@@ -418,6 +418,29 @@ func main() {
 		}
 	}
 	usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
+	usage.SetStatisticsStore(nil)
+	if usePostgresStore {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		pgUsageStore, errUsageStore := usage.NewPostgresStatisticsStore(ctx, usage.PostgresStoreConfig{
+			DSN:    pgStoreDSN,
+			Schema: pgStoreSchema,
+		})
+		cancel()
+		if errUsageStore != nil {
+			log.WithError(errUsageStore).Warn("failed to initialize postgres-backed usage statistics; continuing with in-memory statistics")
+		} else {
+			ctxEnsure, cancelEnsure := context.WithTimeout(context.Background(), 30*time.Second)
+			errEnsure := pgUsageStore.EnsureSchema(ctxEnsure)
+			cancelEnsure()
+			if errEnsure != nil {
+				_ = pgUsageStore.Close()
+				log.WithError(errEnsure).Warn("failed to prepare postgres-backed usage statistics; continuing with in-memory statistics")
+			} else {
+				usage.SetStatisticsStore(pgUsageStore)
+				log.Info("postgres-backed usage statistics enabled, table: usage_records")
+			}
+		}
+	}
 	coreauth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 
 	if err = logging.ConfigureLogOutput(cfg); err != nil {

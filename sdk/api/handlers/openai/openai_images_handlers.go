@@ -529,9 +529,9 @@ func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesR
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, "openai-response", defaultImagesMainModel, responsesReq, "")
-
-	out, errMsg := collectImagesFromResponsesStream(cliCtx, dataChan, errChan, responseFormat)
+	out, upstreamHeaders, errMsg := collectImagesFromResponsesWithRetries(cliCtx, handlers.StreamingBootstrapRetries(h.Cfg), responseFormat, func() (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+		return h.ExecuteStreamWithAuthManager(cliCtx, "openai-response", defaultImagesMainModel, responsesReq, "")
+	})
 	stopKeepAlive()
 	if errMsg != nil {
 		h.WriteErrorResponse(c, errMsg)
@@ -545,6 +545,55 @@ func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesR
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(out)
 	cliCancel()
+}
+
+func collectImagesFromResponsesWithRetries(ctx context.Context, retries int, responseFormat string, execute func() (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage)) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	if retries < 0 {
+		retries = 0
+	}
+
+	var lastErr *interfaces.ErrorMessage
+	var lastHeaders http.Header
+	for attempt := 0; attempt <= retries; attempt++ {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, lastHeaders, &interfaces.ErrorMessage{StatusCode: http.StatusRequestTimeout, Error: err}
+			}
+		}
+
+		dataChan, upstreamHeaders, errChan := execute()
+		if upstreamHeaders != nil {
+			lastHeaders = upstreamHeaders
+		}
+
+		out, errMsg := collectImagesFromResponsesStream(ctx, dataChan, errChan, responseFormat)
+		if errMsg == nil {
+			return out, lastHeaders, nil
+		}
+
+		lastErr = errMsg
+		if attempt >= retries || !isRetryableImagesResponseError(errMsg) {
+			break
+		}
+		if ctx != nil && ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, lastHeaders, lastErr
+}
+
+func isRetryableImagesResponseError(errMsg *interfaces.ErrorMessage) bool {
+	if errMsg == nil || errMsg.Error == nil {
+		return false
+	}
+	if errMsg.StatusCode == http.StatusRequestTimeout || errMsg.StatusCode >= http.StatusInternalServerError {
+		msg := strings.ToLower(errMsg.Error.Error())
+		return strings.Contains(msg, "stream disconnected before completion") ||
+			strings.Contains(msg, "stream closed before response.completed") ||
+			strings.Contains(msg, "unexpected eof") ||
+			strings.Contains(msg, "connection reset")
+	}
+	return false
 }
 
 func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, errs <-chan *interfaces.ErrorMessage, responseFormat string) ([]byte, *interfaces.ErrorMessage) {

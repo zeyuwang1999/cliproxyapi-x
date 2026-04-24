@@ -254,6 +254,7 @@ func validateAntigravityRequestSignatures(from sdktranslator.Format, rawJSON []b
 		// by dropping unsigned thinking blocks silently (no 400).
 		return rawJSON, nil
 	}
+	rawJSON = antigravityclaude.StripInvalidSignatureThinkingBlocks(rawJSON)
 	if err := antigravityclaude.ValidateClaudeBypassSignatures(rawJSON); err != nil {
 		return rawJSON, statusErr{code: http.StatusBadRequest, msg: err.Error()}
 	}

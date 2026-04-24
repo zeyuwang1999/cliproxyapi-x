@@ -78,6 +78,23 @@ type claudeSignatureTree struct {
 // stripping any cache prefix). These come from proxy-generated responses
 // (Antigravity/Gemini) where no real Claude signature exists.
 func StripEmptySignatureThinkingBlocks(payload []byte) []byte {
+	return stripThinkingBlocksBySignature(payload, func(signature string) bool {
+		return hasValidClaudeSignature(signature)
+	})
+}
+
+// StripInvalidSignatureThinkingBlocks removes thinking blocks whose signatures
+// fail strict Claude bypass validation. This lets bypass mode preserve usable
+// content while avoiding upstream rejection for stale or proxy-generated
+// thinking signatures.
+func StripInvalidSignatureThinkingBlocks(payload []byte) []byte {
+	return stripThinkingBlocksBySignature(payload, func(signature string) bool {
+		_, err := normalizeClaudeBypassSignature(signature)
+		return err == nil
+	})
+}
+
+func stripThinkingBlocksBySignature(payload []byte, keepSignature func(string) bool) []byte {
 	messages := gjson.GetBytes(payload, "messages")
 	if !messages.IsArray() {
 		return payload
@@ -91,7 +108,7 @@ func StripEmptySignatureThinkingBlocks(payload []byte) []byte {
 		var kept []string
 		stripped := false
 		for _, part := range content.Array() {
-			if part.Get("type").String() == "thinking" && !hasValidClaudeSignature(part.Get("signature").String()) {
+			if part.Get("type").String() == "thinking" && !keepSignature(part.Get("signature").String()) {
 				stripped = true
 				continue
 			}

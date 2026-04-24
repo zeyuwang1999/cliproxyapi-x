@@ -9,7 +9,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
@@ -29,6 +31,24 @@ func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T)
 	}
 	if got := gjson.GetBytes(wsReqBody, "type").String(); got == "response.append" {
 		t.Fatalf("unexpected websocket request type: %s", got)
+	}
+}
+
+func TestApplyCodexPromptCacheHeadersOpenAIResponsesStripsPreviousResponseID(t *testing.T) {
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","prompt_cache_key":"session-1","input":[{"type":"message","id":"msg-1"}]}`),
+	}
+	body, headers := applyCodexPromptCacheHeaders(sdktranslator.FromString("openai-response"), req, req.Payload)
+
+	if gjson.GetBytes(body, "previous_response_id").Exists() {
+		t.Fatalf("previous_response_id leaked websocket body: %s", body)
+	}
+	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != "session-1" {
+		t.Fatalf("prompt_cache_key = %s, want session-1", got)
+	}
+	if got := headers.Get("Conversation_id"); got != "session-1" {
+		t.Fatalf("Conversation_id = %s, want session-1", got)
 	}
 }
 

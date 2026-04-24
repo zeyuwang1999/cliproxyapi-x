@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
@@ -45,7 +46,9 @@ func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
 }
 
 type responsesSSEFramer struct {
-	pending []byte
+	pending         []byte
+	onFrame         func([]byte)
+	onTerminalError func()
 }
 
 func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
@@ -61,7 +64,11 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 		if frameLen == 0 {
 			break
 		}
-		writeResponsesSSEChunk(w, f.pending[:frameLen])
+		frame := bytes.Clone(f.pending[:frameLen])
+		if f.onFrame != nil {
+			f.onFrame(frame)
+		}
+		writeResponsesSSEChunk(w, frame)
 		copy(f.pending, f.pending[frameLen:])
 		f.pending = f.pending[:len(f.pending)-frameLen]
 	}
@@ -72,7 +79,11 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 	if len(f.pending) == 0 || !responsesSSECanEmitWithoutDelimiter(f.pending) {
 		return
 	}
-	writeResponsesSSEChunk(w, f.pending)
+	frame := bytes.Clone(f.pending)
+	if f.onFrame != nil {
+		f.onFrame(frame)
+	}
+	writeResponsesSSEChunk(w, frame)
 	f.pending = f.pending[:0]
 }
 
@@ -254,6 +265,24 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		})
 		return
 	}
+	if !json.Valid(rawJSON) {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: "Invalid request: body must be valid JSON",
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+	if strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String()) == "" {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: "Invalid request: model is required",
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
@@ -271,6 +300,24 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: fmt.Sprintf("Invalid request: %v", err),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+	if !json.Valid(rawJSON) {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: "Invalid request: body must be valid JSON",
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+	if strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String()) == "" {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: "Invalid request: model is required",
 				Type:    "invalid_request_error",
 			},
 		})
@@ -318,18 +365,35 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 //   - rawJSON: The raw JSON bytes of the OpenAIResponses-compatible request
 func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []byte) {
 	c.Header("Content-Type", "application/json")
+	rawJSON, continuity := prepareResponsesContinuityRequest(rawJSON)
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	selectedAuthID := continuity.PinnedAuthID
+	if selectedAuthID != "" {
+		defaultResponsesContinuationCache.bindSessionAuth(continuity.SessionKey, selectedAuthID)
+		cliCtx = handlers.WithPinnedAuthID(cliCtx, selectedAuthID)
+	} else {
+		cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
+			authID = strings.TrimSpace(authID)
+			if authID == "" {
+				return
+			}
+			selectedAuthID = authID
+			defaultResponsesContinuationCache.bindSessionAuth(continuity.SessionKey, authID)
+		})
+	}
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 	stopKeepAlive()
 	if errMsg != nil {
+		defaultResponsesContinuationCache.unbindSessionAuth(continuity.SessionKey, selectedAuthID)
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
 	}
+	recordResponsesContinuityFromPayload(continuity.SessionKey, selectedAuthID, resp)
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(resp)
 	cliCancel()
@@ -356,8 +420,23 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	}
 
 	// New core execution path
+	rawJSON, continuity := prepareResponsesContinuityRequest(rawJSON)
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	selectedAuthID := continuity.PinnedAuthID
+	if selectedAuthID != "" {
+		defaultResponsesContinuationCache.bindSessionAuth(continuity.SessionKey, selectedAuthID)
+		cliCtx = handlers.WithPinnedAuthID(cliCtx, selectedAuthID)
+	} else {
+		cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
+			authID = strings.TrimSpace(authID)
+			if authID == "" {
+				return
+			}
+			selectedAuthID = authID
+			defaultResponsesContinuationCache.bindSessionAuth(continuity.SessionKey, authID)
+		})
+	}
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 
 	setSSEHeaders := func() {
@@ -366,7 +445,14 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
-	framer := &responsesSSEFramer{}
+	framer := &responsesSSEFramer{
+		onFrame: func(frame []byte) {
+			recordResponsesContinuityFromSSEFrame(continuity.SessionKey, selectedAuthID, frame)
+		},
+		onTerminalError: func() {
+			defaultResponsesContinuationCache.unbindSessionAuth(continuity.SessionKey, selectedAuthID)
+		},
+	}
 
 	// Peek at the first chunk
 	for {
@@ -381,6 +467,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 				continue
 			}
 			// Upstream failed immediately. Return proper error status and JSON.
+			defaultResponsesContinuationCache.unbindSessionAuth(continuity.SessionKey, selectedAuthID)
 			h.WriteErrorResponse(c, errMsg)
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
@@ -426,6 +513,9 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 			framer.Flush(c.Writer)
 			if errMsg == nil {
 				return
+			}
+			if framer.onTerminalError != nil {
+				framer.onTerminalError()
 			}
 			status := http.StatusInternalServerError
 			if errMsg.StatusCode > 0 {

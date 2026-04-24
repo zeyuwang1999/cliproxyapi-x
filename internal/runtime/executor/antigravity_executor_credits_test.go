@@ -17,10 +17,17 @@ import (
 )
 
 func resetAntigravityCreditsRetryState() {
-	antigravityCreditsFailureByAuth = sync.Map{}
-	antigravityShortCooldownByAuth = sync.Map{}
-	antigravityCreditsBalanceByAuth = sync.Map{}
-	antigravityCreditsHintRefreshByID = sync.Map{}
+	clearSyncMap(&antigravityCreditsFailureByAuth)
+	clearSyncMap(&antigravityShortCooldownByAuth)
+	clearSyncMap(&antigravityCreditsBalanceByAuth)
+	clearSyncMap(&antigravityCreditsHintRefreshByID)
+}
+
+func clearSyncMap(m *sync.Map) {
+	m.Range(func(key, _ any) bool {
+		m.Delete(key)
+		return true
+	})
 }
 
 func TestClassifyAntigravity429(t *testing.T) {

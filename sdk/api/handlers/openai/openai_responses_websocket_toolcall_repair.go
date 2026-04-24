@@ -219,6 +219,33 @@ func repairResponsesWebsocketToolCalls(sessionKey string, payload []byte) []byte
 	return repairResponsesWebsocketToolCallsWithCaches(defaultWebsocketToolOutputCache, defaultWebsocketToolCallCache, sessionKey, payload)
 }
 
+func repairResponsesToolCallsForTranscript(sessionKey string, payload []byte) []byte {
+	return repairResponsesToolCallsForTranscriptWithCaches(defaultWebsocketToolOutputCache, defaultWebsocketToolCallCache, sessionKey, payload)
+}
+
+func repairResponsesToolCallsForTranscriptWithCaches(outputCache, callCache *websocketToolOutputCache, sessionKey string, payload []byte) []byte {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" || outputCache == nil || len(payload) == 0 {
+		return payload
+	}
+
+	input := gjson.GetBytes(payload, "input")
+	if !input.Exists() || !input.IsArray() {
+		return payload
+	}
+
+	updatedRaw, errRepair := repairResponsesToolCallsArray(outputCache, callCache, sessionKey, input.Raw, false)
+	if errRepair != nil || updatedRaw == "" || updatedRaw == input.Raw {
+		return payload
+	}
+
+	updated, errSet := sjson.SetRawBytes(payload, "input", []byte(updatedRaw))
+	if errSet != nil {
+		return payload
+	}
+	return updated
+}
+
 func repairResponsesWebsocketToolCallsWithCache(cache *websocketToolOutputCache, sessionKey string, payload []byte) []byte {
 	return repairResponsesWebsocketToolCallsWithCaches(cache, nil, sessionKey, payload)
 }

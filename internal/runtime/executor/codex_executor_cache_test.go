@@ -62,3 +62,31 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 		t.Fatalf("prompt_cache_key (second call) = %q, want %q", gotKey2, expectedKey)
 	}
 }
+
+func TestCodexExecutorCacheHelper_OpenAIResponsesStripsPreviousResponseID(t *testing.T) {
+	executor := &CodexExecutor{}
+	rawJSON := []byte(`{"model":"gpt-5.5","previous_response_id":"resp-1","prompt_cache_key":"session-1","input":[{"type":"function_call_output","call_id":"call-1","output":"ok"}]}`)
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: rawJSON,
+	}
+
+	httpReq, err := executor.cacheHelper(context.Background(), sdktranslator.FromString("openai-response"), "https://example.com/responses", req, rawJSON)
+	if err != nil {
+		t.Fatalf("cacheHelper error: %v", err)
+	}
+	body, errRead := io.ReadAll(httpReq.Body)
+	if errRead != nil {
+		t.Fatalf("read request body: %v", errRead)
+	}
+
+	if gjson.GetBytes(body, "previous_response_id").Exists() {
+		t.Fatalf("previous_response_id leaked upstream body: %s", body)
+	}
+	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != "session-1" {
+		t.Fatalf("prompt_cache_key = %q, want session-1", got)
+	}
+	if got := httpReq.Header.Get("Session_id"); got != "session-1" {
+		t.Fatalf("Session_id = %q, want session-1", got)
+	}
+}

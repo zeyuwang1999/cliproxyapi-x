@@ -804,6 +804,9 @@ func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecuto
 		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
 		headers.Set("Conversation_id", cache.ID)
 	}
+	if from == "openai-response" {
+		rawJSON, _ = sjson.DeleteBytes(rawJSON, "previous_response_id")
+	}
 
 	return rawJSON, headers
 }

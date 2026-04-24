@@ -4,7 +4,6 @@ import "testing"
 
 func TestCodexStaticModelsIncludeGPT55(t *testing.T) {
 	tierModels := map[string][]*ModelInfo{
-		"free": GetCodexFreeModels(),
 		"team": GetCodexTeamModels(),
 		"plus": GetCodexPlusModels(),
 		"pro":  GetCodexProModels(),
@@ -18,6 +17,10 @@ func TestCodexStaticModelsIncludeGPT55(t *testing.T) {
 			}
 			assertGPT55ModelInfo(t, tier, model)
 		})
+	}
+
+	if model := findModelInfo(GetCodexFreeModels(), "gpt-5.5"); model != nil {
+		t.Fatal("expected codex free tier to omit gpt-5.5")
 	}
 
 	model := LookupStaticModelInfo("gpt-5.5")
