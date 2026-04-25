@@ -16,11 +16,14 @@ import (
 )
 
 type fakeUsageStore struct {
-	snapshot     usage.StatisticsSnapshot
-	snapshotErr  error
-	importResult usage.MergeResult
-	importErr    error
-	imported     bool
+	snapshot       usage.StatisticsSnapshot
+	snapshotErr    error
+	complete       usage.StatisticsSnapshot
+	completeErr    error
+	completeCalled bool
+	importResult   usage.MergeResult
+	importErr      error
+	imported       bool
 }
 
 func (f *fakeUsageStore) EnsureSchema(context.Context) error { return nil }
@@ -32,6 +35,14 @@ func (f *fakeUsageStore) Snapshot(context.Context) (usage.StatisticsSnapshot, er
 		return usage.StatisticsSnapshot{}, f.snapshotErr
 	}
 	return f.snapshot, nil
+}
+
+func (f *fakeUsageStore) CompleteSnapshot(context.Context) (usage.StatisticsSnapshot, error) {
+	f.completeCalled = true
+	if f.completeErr != nil {
+		return usage.StatisticsSnapshot{}, f.completeErr
+	}
+	return f.complete, nil
 }
 
 func (f *fakeUsageStore) ImportSnapshot(context.Context, usage.StatisticsSnapshot) (usage.MergeResult, error) {
@@ -91,6 +102,65 @@ func TestGetUsageStatisticsFallsBackToMemory(t *testing.T) {
 	}
 	if response.Usage.TotalRequests != 1 || response.Usage.APIs["memory-key"].TotalRequests != 1 {
 		t.Fatalf("usage snapshot = %+v, want memory fallback", response.Usage)
+	}
+}
+
+func TestExportUsageStatisticsUsesCompletePersistentSnapshot(t *testing.T) {
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	store := &fakeUsageStore{
+		snapshot: usage.StatisticsSnapshot{
+			TotalRequests: 1,
+			APIs:          map[string]usage.APISnapshot{},
+		},
+		complete: snapshotWithOneDetail("complete-key", "gpt-5.4"),
+	}
+	h.SetUsageStore(store)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage/export", nil)
+	h.ExportUsageStatistics(c)
+
+	var response usageExportPayload
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if !store.completeCalled {
+		t.Fatal("complete persistent snapshot was not called")
+	}
+	if response.Usage.APIs["complete-key"].Models["gpt-5.4"].Details == nil {
+		t.Fatalf("export usage snapshot = %+v, want full details", response.Usage)
+	}
+}
+
+func TestExportUsageStatisticsFailsWhenCompletePersistentSnapshotFails(t *testing.T) {
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	store := &fakeUsageStore{
+		snapshot: usage.StatisticsSnapshot{
+			TotalRequests: 1,
+			APIs:          map[string]usage.APISnapshot{},
+		},
+		completeErr: errors.New("db unavailable"),
+	}
+	h.SetUsageStore(store)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage/export", nil)
+	h.ExportUsageStatistics(c)
+
+	if !store.completeCalled {
+		t.Fatal("complete persistent snapshot was not called")
+	}
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusInternalServerError)
+	}
+	var response map[string]string
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if response["error"] == "" {
+		t.Fatalf("response error is empty: %s", recorder.Body.String())
 	}
 }
 

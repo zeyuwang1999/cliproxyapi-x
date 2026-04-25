@@ -32,7 +32,11 @@ func (h *Handler) GetUsageStatistics(c *gin.Context) {
 
 // ExportUsageStatistics returns a complete usage snapshot for backup/migration.
 func (h *Handler) ExportUsageStatistics(c *gin.Context) {
-	snapshot := h.usageSnapshot(c)
+	snapshot, err := h.usageExportSnapshot(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to export complete usage statistics"})
+		return
+	}
 	c.JSON(http.StatusOK, usageExportPayload{
 		Version:    1,
 		ExportedAt: time.Now().UTC(),
@@ -86,6 +90,20 @@ func (h *Handler) usageSnapshot(c *gin.Context) usage.StatisticsSnapshot {
 		snapshot = h.usageStats.Snapshot()
 	}
 	return snapshot
+}
+
+func (h *Handler) usageExportSnapshot(c *gin.Context) (usage.StatisticsSnapshot, error) {
+	if h != nil && h.usageStore != nil && c != nil && c.Request != nil {
+		if completeStore, ok := h.usageStore.(usage.CompleteStatisticsStore); ok {
+			completeSnapshot, err := completeStore.CompleteSnapshot(c.Request.Context())
+			if err == nil {
+				return completeSnapshot, nil
+			}
+			log.WithError(err).Warn("failed to export complete persisted usage statistics")
+			return usage.StatisticsSnapshot{}, err
+		}
+	}
+	return h.usageSnapshot(c), nil
 }
 
 func (h *Handler) importUsageSnapshot(c *gin.Context, snapshot usage.StatisticsSnapshot) usage.MergeResult {

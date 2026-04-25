@@ -23,21 +23,27 @@ type StatisticsStore interface {
 	ImportSnapshot(ctx context.Context, snapshot StatisticsSnapshot) (MergeResult, error)
 }
 
+// CompleteStatisticsStore can rebuild a full-fidelity snapshot for backups.
+// Snapshot is optimized for the management page and may intentionally cap details.
+type CompleteStatisticsStore interface {
+	CompleteSnapshot(ctx context.Context) (StatisticsSnapshot, error)
+}
+
 // UsageRecord is the normalized, persistence-friendly representation of one
 // usage event.
 type UsageRecord struct {
-	RecordKey   string
-	APIKey      string
-	APIKeyHash  string
-	Provider    string
-	Model       string
-	Source      string
-	AuthID      string
-	AuthIndex   string
-	RequestedAt time.Time
-	LatencyMs   int64
-	Failed      bool
-	Tokens      TokenStats
+	RecordKey   string     `json:"record_key"`
+	APIKey      string     `json:"api_key"`
+	APIKeyHash  string     `json:"api_key_hash"`
+	Provider    string     `json:"provider"`
+	Model       string     `json:"model"`
+	Source      string     `json:"source"`
+	AuthID      string     `json:"auth_id"`
+	AuthIndex   string     `json:"auth_index"`
+	RequestedAt time.Time  `json:"requested_at"`
+	LatencyMs   int64      `json:"latency_ms"`
+	Failed      bool       `json:"failed"`
+	Tokens      TokenStats `json:"tokens"`
 }
 
 type persistentPlugin struct {
@@ -146,8 +152,7 @@ func normalizeUsageRecord(ctx context.Context, record coreusage.Record) UsageRec
 		Tokens:    tokens,
 		Failed:    failed,
 	}
-	return UsageRecord{
-		RecordKey:   stableUsageRecordKey(statsKey, modelName, detail),
+	return normalizeStoredUsageRecord(UsageRecord{
 		APIKey:      usageDisplayLabel(statsKey, sensitiveStatsKey),
 		APIKeyHash:  hashUsageValue(statsKey),
 		Provider:    record.Provider,
@@ -159,7 +164,7 @@ func normalizeUsageRecord(ctx context.Context, record coreusage.Record) UsageRec
 		LatencyMs:   detail.LatencyMs,
 		Failed:      failed,
 		Tokens:      tokens,
-	}
+	})
 }
 
 func stableUsageRecordKey(apiName, modelName string, detail RequestDetail) string {
