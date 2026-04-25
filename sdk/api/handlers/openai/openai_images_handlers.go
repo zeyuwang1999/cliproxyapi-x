@@ -527,6 +527,7 @@ func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesR
 	c.Header("Content-Type", "application/json")
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
 	out, upstreamHeaders, errMsg := collectImagesFromResponsesWithRetries(cliCtx, handlers.StreamingBootstrapRetries(h.Cfg), responseFormat, func() (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
@@ -765,6 +766,7 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 	}
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, "openai-response", defaultImagesMainModel, responsesReq, "")
 
 	setSSEHeaders := func() {
